@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#000000">
+  <title>RVR Showroom</title>
+  <meta name="description" content="Move through the RVR showroom in 3D: the entrance, the gallery, the workshop and the lounge.">
+
+  <link rel="preload" href="assets/fonts/michroma.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="assets/scene/manifest.json" as="fetch" crossorigin>
+  <link rel="modulepreload" href="js/vendor/three/build/three.module.min.js">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="css/showroom.css">
+
+  <!-- Three.js r170 is stored in this project (js/vendor/three), so the site needs no CDN. -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./js/vendor/three/build/three.module.min.js"
+      }
+    }
+  </script>
+</head>
+<body class="is-loading">
+
+  <!-- Loading screen: stays up until the 3D data for the first view has loaded and the first
+       frame has been drawn. -->
+  <div class="loader" id="loader" role="status" aria-live="polite">
+    <div class="loader__mark" aria-hidden="true">RVR</div>
+    <div class="loader__bar" aria-hidden="true"><span id="loader-bar"></span></div>
+    <p class="loader__status" id="loader-status">Loading the showroom</p>
+  </div>
+
+  <!--
+    3D SHOWROOM (reconstructed from the client video)
+    - .showroom is a tall section; its height is how much scrolling the walk-through takes
+      (--tour-length in css/showroom.css).
+    - .showroom__stage sticks to the screen while you scroll through it.
+    - js/recon.js draws the reconstruction (assets/scene/) with Three.js and moves the camera
+      along the camera path recovered from the video as you scroll.
+  -->
+  <section class="showroom" id="showroom" aria-label="RVR showroom in 3D" hidden>
+    <div class="showroom__stage">
+      <canvas class="showroom__canvas" id="showroom-canvas" aria-hidden="true"></canvas>
+
+      <div class="showroom__hint" id="scroll-hint">Scroll to enter</div>
+      <div class="showroom__status" id="scene-status" hidden>Loading</div>
+
+      <nav class="showroom__nav" id="area-nav" aria-label="Showroom areas">
+        <button type="button" data-area="0"><span>Entrance</span></button>
+        <button type="button" data-area="1"><span>Gallery</span></button>
+        <button type="button" data-area="2"><span>Workshop</span></button>
+        <button type="button" data-area="3"><span>Lounge</span></button>
+      </nav>
+    </div>
+  </section>
+
+  <!--
+    FALLBACK: the original scroll-controlled video, shown only on devices that can't run the
+    3D version (no WebGL 2), or with ?video in the address. Uses script.js unchanged.
+    The video address is in data-src so it only downloads when the fallback is used.
+  -->
+  <section class="scroll-video" id="scroll-video" hidden>
+    <div class="scroll-video__stage">
+      <video
+        class="scroll-video__media"
+        data-src="./assets/RVR1.mp4"
+        data-mobile-src="./assets/RVR1-mobile.mp4"
+        muted
+        playsinline
+        webkit-playsinline
+        preload="metadata"
+        disablepictureinpicture
+        disableremoteplayback
+        aria-hidden="true"
+        tabindex="-1"></video>
+    </div>
+  </section>
+
+  <!-- Future sections go here, below the showroom. -->
+
+  <script>
+    /* Decide between the 3D version and the video fallback before anything heavy loads. */
+    (function () {
+      var params = new URLSearchParams(location.search);
+      function hasWebGL2() {
+        try { return !!document.createElement('canvas').getContext('webgl2'); } catch (e) { return false; }
+      }
+      var importMaps = typeof HTMLScriptElement !== 'undefined' && HTMLScriptElement.supports && HTMLScriptElement.supports('importmap');
+
+      window.RVR = {
+        mode: params.has('video') || !hasWebGL2() || !importMaps ? 'video' : '3d',
+        started: false,
+        useVideo: function (reason) {
+          if (window.RVR.mode === 'video-active') return;
+          window.RVR.mode = 'video-active';
+          if (reason) console.warn('RVR showroom: using the video version (' + reason + ').');
+          document.getElementById('showroom').hidden = true;
+          var video = document.querySelector('#scroll-video video');
+          video.setAttribute('src', video.getAttribute('data-src'));
+          document.getElementById('scroll-video').hidden = false;
+          var s = document.createElement('script');
+          s.src = 'script.js';
+          document.body.appendChild(s);
+          var loader = document.getElementById('loader');
+          loader.classList.add('is-done');
+          document.body.classList.remove('is-loading');
+          setTimeout(function () { loader.hidden = true; }, 1000);
+        }
+      };
+
+      if (window.RVR.mode === 'video') {
+        window.RVR.useVideo(params.has('video') ? 'requested' : 'this browser cannot run the 3D version');
+      } else {
+        document.getElementById('showroom').hidden = false;
+        // If the 3D code never starts (blocked or failed to download), fall back after 12 s.
+        setTimeout(function () { if (!window.RVR.started) window.RVR.useVideo('3D code did not start'); }, 12000);
+      }
+    })();
+  </script>
+  <script type="module" src="js/recon.js"></script>
+</body>
+</html>

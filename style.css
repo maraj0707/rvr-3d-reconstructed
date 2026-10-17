@@ -1,0 +1,65 @@
+/* ---------- Base ---------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: #000;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+/* ---------- Scroll-controlled video ---------- */
+
+.scroll-video {
+  /*
+    How much scrolling it takes to go from the first frame to the last.
+    Bigger number = the video moves slower as you scroll.
+    1200vh = about 11 screen-heights of scrolling for the whole video.
+  */
+  --scroll-length: 1200vh;
+
+  position: relative;
+  height: var(--scroll-length);
+}
+
+/* The part that stays pinned to the screen while the section scrolls by. */
+.scroll-video__stage {
+  position: sticky;
+  top: 0;
+  width: 100%;
+  height: 100vh;        /* fallback for older browsers */
+  height: 100lvh;       /* full screen on phones, even when the browser bar hides */
+  overflow: hidden;
+  background: #000;
+}
+
+/* The video fills the screen edge to edge, keeping its aspect ratio (cropped, never stretched). */
+.scroll-video__media {
+  position: absolute;
+  inset: 0;
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  pointer-events: none;   /* clicks and touches pass through, so scrolling is never blocked */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* Hide the built-in play button some phones (e.g. iPhone in Low Power Mode) draw on top of videos. */
+.scroll-video__media::-webkit-media-controls,
+.scroll-video__media::-webkit-media-controls-start-playback-button,
+.scroll-video__media::-webkit-media-controls-overlay-play-button {
+  display: none !important;
+  -webkit-appearance: none;
+}

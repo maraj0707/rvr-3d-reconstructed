@@ -1,0 +1,2 @@
+Three.js r170 (three@0.170.0), MIT licence (see LICENSE).
+Only the files this site uses are included.
