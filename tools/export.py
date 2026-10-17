@@ -20,10 +20,12 @@ from PIL import Image
 
 from depth import DW, DH, floor_plane, keyframe_depth
 
-SHOT_NAMES = ['Entrance', 'Gallery', 'Gallery tables', 'Towards the workshop', 'Workshop bench', 'Lounge']
-# Where the camera jumps inside a reconstructed shot (hidden cut with a 1 m jump at 18.625 s): the website
-# treats it like a cut (separate parts, dissolve) instead of flying the camera through the jump.
-JUMPS = {0: [18.625]}
+SHOT_NAMES = ['Entrance', 'Gallery entry', 'Gallery', 'Gallery tables', 'Towards the workshop', 'Workshop bench',
+              'Workshop bench (2)', 'Lounge']
+# The video's two cuts inside the first reconstructed shot (15.625 s after the shutter, 18.625 s with a
+# 1 m jump): the website treats them like the other cuts (separate parts, short timed cross-fade)
+# instead of moving the camera through them.
+JUMPS = {0: [15.625, 18.625], 3: [36.458]}
 AREAS = [('Entrance', 0.0), ('Gallery', 15.75), ('Workshop', 28.9), ('Lounge', 40.5)]
 GW, GH = 192, 108
 HD, SD = (1600, 900), (960, 540)
@@ -33,7 +35,10 @@ FLOOR_SHOTS = ()
 # Cuts whose bridge was good enough to fly the camera through (checked visually): shot 2 -> shot 3.
 # The 3 -> 4 bridge has a few degrees of error and looked broken mid-flight, so that cut dissolves.
 FLY_CUTS = {(1, 2)}
-HIDDEN_CUTS = {0: [15.625, 18.625]}  # jumps inside shot 1 that the cut detector missed (frame differences)
+HIDDEN_CUTS = {0: [15.625, 18.625], 3: [36.458]}  # 36.458 s: the camera jumps ~0.5 m (found in the per-frame path)  # jumps inside shot 1 that the cut detector missed (frame differences)
+# shots where the camera moves fast past nearby objects (workshop, bench, lounge): a keyframe at every
+# SfM frame (1/6 s) instead of every second one, so each view is reprojected over a shorter distance
+DENSE_SHOTS = (2, 3, 4)
 STATIC = (6.0, 15.59)  # shot 1: the camera stands still in front of the door while the shutter rolls up
 OPENING = (7.25, 14.5)  # shutter moving: keyframes every 0.25 s instead of 0.5 s
 T0 = time.time()
@@ -128,8 +133,8 @@ def three_quat(R_new):
     return q / np.linalg.norm(q)
 
 
-def pick_keyframes(times, frames, cuts=()):
-    """Indices (into frames) of keyframes: every ~0.5 s, every SfM frame (0.25 s) while the shutter
+def pick_keyframes(times, frames, cuts=(), spacing=0.49):
+    """Indices (into frames) of keyframes: every `spacing` s, every SfM frame (0.25 s) while the shutter
     moves, and always the frames on both sides of a (hidden) cut and of the static period."""
     ts = times[frames]
     must = {0, len(frames) - 1}
@@ -140,9 +145,9 @@ def pick_keyframes(times, frames, cuts=()):
             must |= {int(before[-1]), int(after[0])}
     keep = [0]
     for k in range(1, len(frames)):
-        gap = 0.24 if OPENING[0] <= ts[k] <= OPENING[1] else 0.49
+        gap = 0.24 if OPENING[0] <= ts[k] <= OPENING[1] else spacing
         if k in must or ts[k] - ts[keep[-1]] >= gap - 1e-6:
-            if keep[-1] in must or k in must or ts[k] - ts[keep[-1]] >= 0.2:
+            if keep[-1] in must or k in must or ts[k] - ts[keep[-1]] >= min(0.2, gap) - 1e-6:
                 keep.append(k)
     return sorted(set(keep) | must)
 
@@ -162,7 +167,9 @@ def repair_poses(ts, Rs, tvecs, cuts=(), log=print):
             continue
         med = np.array([np.median(C[idx[max(0, k - 3):k + 4]], axis=0) for k in range(len(idx))])
         dev = np.linalg.norm(C[idx] - med, axis=1)
-        thr = max(4 * np.median(dev), 0.5 * med_step)
+        # only clear outliers (several steps off the path); a real change of speed or direction
+        # (e.g. the workshop shot at 36.3 s) must stay as it is
+        thr = max(4 * np.median(dev), 1.5 * med_step)
         bad[idx[dev > thr]] = True
     Rs, tvecs = Rs.copy(), tvecs.copy()
     for k in np.where(bad)[0]:
@@ -211,6 +218,131 @@ def shutter_edges(imgs, closed, opened):
         edges.append(edge)
         prev = edge
     return (x0, x1, y0, y1), edges
+
+
+def dense_path(r2, s, wf, sfm_t, sfm_R, sfm_t_vec):
+    """Per-video-frame camera poses of shot s in world coordinates: [(t, R_world_to_cam, C_world)].
+    Frames whose PnP pose is off (more than 3 robust deviations from a running median, e.g. while a
+    moving video wall fills the view) are replaced by interpolation; the rest gets a light Gaussian
+    smoothing (sigma = 1 frame) so the camera doesn't jitter by sub-pixel noise."""
+    from scipy.spatial.transform import Rotation, Slerp
+    p = os.path.join(r2, 'dense_poses.npz')
+    if not os.path.exists(p):
+        return None
+    d = np.load(p)
+    fr = d[f'frame{s}']
+    if len(fr) < 10:
+        return None
+    Rs = d[f'R{s}']
+    ts = d[f't{s}']
+    t = fr / 24.0
+    C = np.array([-R.T @ tt for R, tt in zip(Rs, ts)])
+    # segments between cuts (don't smooth across them)
+    bounds = HIDDEN_CUTS.get(s, []) + ([STATIC[0] - 1e-3, STATIC[1]] if s == 0 else [])
+    seg = np.searchsorted(np.array(sorted(bounds)), t, side='right') if bounds else np.zeros(len(t), int)
+    good = np.ones(len(t), bool)
+    for sg in np.unique(seg):
+        idx = np.where(seg == sg)[0]
+        if len(idx) < 7:
+            continue
+        med = np.array([np.median(C[idx[max(0, k - 4):k + 5]], axis=0) for k in range(len(idx))])
+        dev = np.linalg.norm(C[idx] - med, axis=1)
+        step = np.median(np.linalg.norm(np.diff(C[idx], axis=0), axis=1)) + 1e-9
+        bad = dev > max(6 * np.median(dev), 2.0 * step)
+        # also the SfM keyframe poses decide: a dense pose far from the SfM pose at the same time is bad
+        good[idx[bad]] = False
+    # anchor to the SfM poses where they exist (frame times coincide)
+    # where they disagree strongly (22.75 / 23.0 s: the moving video wall fills the view and pulls the
+    # per-frame registration), the bundle-adjusted SfM pose wins: the per-frame poses from the previous
+    # to the next SfM frame are dropped and the path is interpolated through the SfM poses there
+    sfm_t_ = np.asarray(sfm_t)
+    for k, tk in enumerate(sfm_t):
+        j = np.where(np.abs(t - tk) < 1e-3)[0]
+        if len(j):
+            Ck = -sfm_R[k].T @ sfm_t_vec[k]
+            step = 1e-9 + np.median(np.linalg.norm(np.diff(C, axis=0), axis=1))
+            if np.linalg.norm(C[j[0]] - Ck) > 3 * step:
+                lo_t = sfm_t_[sfm_t_ < tk - 1e-3].max(initial=-1e9)
+                hi_t = sfm_t_[sfm_t_ > tk + 1e-3].min(initial=1e9)
+                good[(t > lo_t + 1e-3) & (t < hi_t - 1e-3) & (seg == seg[j[0]])] = False
+    keep = np.where(good)[0]
+    rot = Rotation.from_matrix(Rs[keep])
+    out_R, out_C = [], []
+    for k in range(len(t)):
+        if good[k]:
+            out_R.append(Rs[k]); out_C.append(C[k]); continue
+        lo = keep[keep < k]; hi = keep[keep > k]
+        if not len(lo) or not len(hi):
+            j = lo[-1] if len(lo) else hi[0]
+            out_R.append(Rs[j]); out_C.append(C[j]); continue
+        a, b = lo[-1], hi[0]
+        f = (t[k] - t[a]) / (t[b] - t[a])
+        out_R.append(Slerp([0, 1], Rotation.from_matrix([Rs[a], Rs[b]]))([f]).as_matrix()[0])
+        out_C.append((1 - f) * C[a] + f * C[b])
+    out_R = np.array(out_R); out_C = np.array(out_C)
+    # light smoothing inside each segment
+    sm_C = out_C.copy(); sm_R = out_R.copy()
+    wts = np.array([0.25, 0.5, 0.25])
+    for sg in np.unique(seg):
+        idx = np.where(seg == sg)[0]
+        if len(idx) < 3:
+            continue
+        for n_, k in enumerate(idx):
+            nb = [idx[max(0, n_ - 1)], k, idx[min(len(idx) - 1, n_ + 1)]]
+            sm_C[k] = sum(w * out_C[j] for w, j in zip(wts, nb))
+            q = Rotation.from_matrix(out_R[nb]).as_quat()
+            q[q @ q[1] < 0] *= -1
+            qm = (wts[:, None] * q).sum(0)
+            sm_R[k] = Rotation.from_quat(qm / np.linalg.norm(qm)).as_matrix()
+    # pass exactly through the SfM poses (bundle-adjusted; the keyframe surfaces are placed with them):
+    # the small offset between the per-frame path and the SfM pose is measured at every SfM frame and
+    # interpolated in between, so the per-frame path only adds the motion between SfM frames
+    anchors = []
+    for k, tk in enumerate(sfm_t):
+        j = np.where(np.abs(t - tk) < 1e-3)[0]
+        if not len(j):
+            continue
+        j = int(j[0])
+        Ck = -sfm_R[k].T @ sfm_t_vec[k]
+        anchors.append((j, Rotation.from_matrix(sfm_R[k] @ sm_R[j].T), Ck - sm_C[j]))
+    n_anch = 0
+    for sg in np.unique(seg):
+        idx = np.where(seg == sg)[0]
+        an = [a for a in anchors if seg[a[0]] == sg]
+        if not an:
+            continue
+        n_anch += len(an)
+        at = np.array([t[a[0]] for a in an])
+        for k in idx:
+            if t[k] <= at[0] or len(an) == 1:
+                a = an[0] if t[k] <= at[0] else an[-1]
+                dR, dC = a[1], a[2]
+            elif t[k] >= at[-1]:
+                dR, dC = an[-1][1], an[-1][2]
+            else:
+                i = int(np.searchsorted(at, t[k], side='right')) - 1
+                a, b = an[i], an[i + 1]
+                f = (t[k] - at[i]) / (at[i + 1] - at[i])
+                dR = Slerp([0, 1], Rotation.concatenate([a[1], b[1]]))([f])[0]
+                dC = (1 - f) * a[2] + f * b[2]
+            sm_R[k] = dR.as_matrix() @ sm_R[k]
+            sm_C[k] = sm_C[k] + dC
+    log(f'  shot {s + 1}: path anchored to {n_anch} SfM poses')
+    if s == 0:
+        # the camera stands still in front of the door: hold it exactly at the SfM pose of the closed-door
+        # keyframe (the pose the shutter surfaces are built from); the per-frame poses there only differ
+        # by registration noise
+        k0 = int(np.argmin(np.abs(np.asarray(sfm_t) - STATIC[0])))
+        hold = (t >= STATIC[0] - 1e-3) & (t <= STATIC[1])
+        sm_R[hold] = sfm_R[k0]
+        sm_C[hold] = -sfm_R[k0].T @ sfm_t_vec[k0]
+        log(f'  shot 1: camera held at the SfM pose of {sfm_t[k0]:.3f} s for {hold.sum()} frames')
+    log(f'  shot {s + 1}: dense camera path from {len(t)} video frames ({(~good).sum()} replaced by interpolation)')
+    res = []
+    for k in range(len(t)):
+        Rn = sm_R[k] @ wf['Rw'].T
+        res.append((t[k], Rn, to_world(wf, sm_C[k])))
+    return res
 
 
 def grid_from_depth(d):
@@ -286,11 +418,21 @@ def main(video, r2, site, only=None, images=True):
         link = sd['link']
         # path: every registered frame
         shot_path = []
-        for k, fi in enumerate(frames):
-            Rn, Cw = cam_world(wf, sd['R'][k], sd['t'][k])
-            shot_path.append(dict(shot=s, t=round(float(times[fi]), 4), p=[round(float(v), 5) for v in Cw],
-                                  q=[round(float(v), 6) for v in three_quat(Rn)]))
-        keep = pick_keyframes(times, frames, HIDDEN_CUTS.get(s, ()) if s == 0 else ())
+        dense = dense_path(r2, s, wf, times[frames], sd['R'], sd['t'])
+        if dense is not None:
+            # the camera path at all 24 frames per second (register_all.py), cleaned and lightly smoothed
+            for t_, Rn, Cw in dense:
+                shot_path.append(dict(shot=s, t=round(float(t_), 4), p=[round(float(v), 4) for v in Cw],
+                                      q=[round(float(v), 5) for v in three_quat(Rn)]))
+        else:
+            for k, fi in enumerate(frames):
+                Rn, Cw = cam_world(wf, sd['R'][k], sd['t'][k])
+                shot_path.append(dict(shot=s, t=round(float(times[fi]), 4), p=[round(float(v), 5) for v in Cw],
+                                      q=[round(float(v), 6) for v in three_quat(Rn)]))
+        # keyframe spacing: every SfM frame in shot 1 (0.25 s) and in the fast shots (1/6 s), every 2nd in
+        # the others (1/3 s) - dense keyframes keep the camera close to a real view at all times
+        keep = pick_keyframes(times, frames, HIDDEN_CUTS.get(s, ()),
+                              spacing=0.24 if s == 0 else 0.16 if s in DENSE_SHOTS else 0.32)
         depth_grids = []
         shot_kfs = []
         static = None
@@ -336,7 +478,7 @@ def main(video, r2, site, only=None, images=True):
         for kk in keep:
             fi = frames[kk]
             R, t = sd['R'][kk], sd['t'][kk]
-            name = f'k{len(manifest["keyframes"]) + len(shot_kfs):03d}.webp'
+            name = f'f{int(round(times[fi] * 24)):04d}.webp'  # named after the video frame
             sparse = sparse_for(kk)
             npy = os.path.join(diag, f'{name[:-5]}_depth.npy')
             if REUSE and os.path.exists(npy):
@@ -373,6 +515,11 @@ def main(video, r2, site, only=None, images=True):
             i0, i1 = float(g.min()), float(g.max())
             q = np.round((g - i0) / max(i1 - i0, 1e-9) * 32767).astype(np.uint16)
             depth_grids.append((q << 1) | e.astype(np.uint16))
+            if static and kk in static['keys']:
+                # the camera stands still during the roll-up: every keyframe there (including the open-door
+                # one) is placed at the closed-door camera, which the website holds; then each frame's pixels
+                # land exactly where the video shows them (no 1 px shift from SfM pose noise)
+                R, t = sd['R'][static['closed']], sd['t'][static['closed']]
             Rn, Cw = cam_world(wf, R, t)
             shot_kfs.append(dict(shot=s, t=round(float(times[fi]), 4), image=name, inv=[i0, i1],
                                  M=[round(float(v), 7) for v in Rn.ravel()],  # row-major R = column-major R^T
@@ -394,20 +541,37 @@ def main(video, r2, site, only=None, images=True):
             for i in sel:
                 shot_kfs[i]['shot'] = m_idx
             pth = [dict(p, shot=m_idx) for p in shot_path if lo <= p['t'] < hi]
-            # one small depth file per keyframe, so each keyframe loads on its own (image + depth)
+            # one small depth file per keyframe, so each keyframe loads on its own (image + depth).
+            # Keyframes inside the shutter roll-up only need their image: the website draws the
+            # roll-up on the closed-door and open-door surfaces (the first and last of the period).
+            static_ts = sorted(k['t'] for k in shot_kfs if STATIC[0] - 1e-3 <= k['t'] <= STATIC[1]) if s == 0 else []
             for i in sel:
+                tk = shot_kfs[i]['t']
+                if static_ts and static_ts[0] < tk < static_ts[-1]:
+                    shot_kfs[i]['depth'] = None
+                    shot_kfs[i]['static'] = True
+                    continue
                 dname = shot_kfs[i]['image'].replace('.webp', '.bin')
                 depth_grids[i].ravel().astype('<u2').tofile(os.path.join(scene, 'depth', dname))
                 shot_kfs[i]['depth'] = dname
             manifest['keyframes'] += [shot_kfs[i] for i in sel]
             manifest['path'] += pth
             if m_idx > 0:
-                fly = part == 0 and wfs[s]['group'] == wfs[s - 1]['group']
-                manifest['transitions'].append(dict(type='fly' if fly else 'dissolve', length=0.9 if fly else 0.6))
+                manifest['transitions'].append(dict(type='cut'))  # crossed with a short timed cross-fade
             manifest['shots'].append(dict(name=SHOT_NAMES[m_idx], start=pth[0]['t'], end=pth[-1]['t'],
                                           world=int(wf['group']), source_shot=s + 1))
     if only is not None:
         return
+    # shutter roll-up: measured edge row for every video frame (shutter_track.py)
+    sj = os.path.join(r2, 'shutter.json')
+    if os.path.exists(sj):
+        sd_ = json.load(open(sj))
+        kts = [k['t'] for k in manifest['keyframes']]
+        closed = min(range(len(kts)), key=lambda i: abs(kts[i] - STATIC[0]))
+        open_ = max(i for i in range(len(kts)) if kts[i] <= STATIC[1])
+        manifest['shutter'] = dict(t0=sd_['t0'], fps=sd_['fps'], door=[round(v, 5) for v in sd_['door']],
+                                   edge=sd_['edge'], closed=closed, open=open_)
+        log(f"shutter: closed keyframe {closed} (t={kts[closed]}), open keyframe {open_} (t={kts[open_]}), {len(sd_['edge'])} edge samples")
     with open(os.path.join(scene, 'manifest.json'), 'w') as fh:
         json.dump(manifest, fh, separators=(',', ':'))
     log(f'manifest: {len(manifest["keyframes"])} keyframes, {len(manifest["path"])} path samples')

@@ -18,11 +18,28 @@ invented models. Everything you see in 3D was reconstructed from the footage:
    - bundle adjustment
 
    Every frame of all five shots is placed with a median reprojection error of about 0.5 pixels.
-   The video has two more jumps that are not visible as cuts: at 15.6 s (after the shutter) and at
-   18.6 s (the camera jumps about 1 m forward). A few camera poses where the moving video wall filled
-   the view (22.75–23.0 s) were off the path; they are interpolated from their neighbours.
-2. **Dense depth (multi-view stereo).** About every half second of video there is a *keyframe*,
-   and every quarter second while the shutter rolls up. For each keyframe, a depth map was computed:
+   The video has two more cuts that are easy to miss: at 15.6 s (after the shutter) and at 18.6 s
+   (the camera jumps about 1 m forward).
+2. **Camera pose for every video frame** (`tools/register_all.py`). The structure-from-motion step
+   used 4–6 frames per second. To follow the real camera exactly, all video frames (24 per second)
+   were then placed against the reconstructed 3D points. Results:
+   - 1,108 poses
+   - the path passes exactly through the bundle-adjusted SfM poses (where the keyframes are); the
+     per-frame poses add the motion between them
+   - the few per-frame poses that are off (where the moving video wall fills the view, around
+     22.75–23.0 s) are replaced by interpolation through the SfM poses
+   - a very light smoothing (over 3 frames) removes measurement jitter
+   - during the roll-up (6.0–15.6 s) the camera is held at one pose, as in the video
+
+   This also found a jump of the camera at 36.46 s in the workshop (a hidden edit in the video),
+   which is now handled as a cut.
+3. **Dense depth (multi-view stereo).** There is a *keyframe* (221 in total):
+   - every 0.25 s from the entrance through the gallery (0–24.6 s)
+   - every 1/6 s where the camera moves fast past nearby objects (towards the workshop, the workshop
+     bench, the lounge)
+   - every 1/3 s at the gallery tables
+
+   For each keyframe, a depth map was computed:
    - **Plane-sweep stereo** against the neighbouring frames.
    - **The SfM points**, mixed in as the most reliable depths.
    - **Edge-aware filling**, so depth edges follow the edges in the picture.
@@ -30,19 +47,40 @@ invented models. Everything you see in 3D was reconstructed from the footage:
    While the camera stands still in front of the door, the shutter and the opening behind it get
    separate depth: the shutter's depth from the approach, and the gallery's depth from the frames
    after the door.
-3. **Website (Three.js).** Each keyframe becomes a 3D surface: a mesh of 192 × 108 vertices pushed
+4. **The shutter roll-up, frame by frame** (`tools/shutter_track.py`). From 6.0 s to 15.6 s the
+   camera stands still and the shutter rises as one rigid sheet: its slats move exactly with its bottom
+   edge, to within 0.2 px. The edge position was measured in every one of the 231 video frames. The
+   website draws each moment from the two nearest video frames:
+   - The shutter part is taken from each frame shifted by how far the edge has moved since then, so
+     there is never a double edge.
+   - The gallery comes from where those frames already show it.
+
+   The edge follows the measured curve continuously, at any scroll speed.
+5. **Website (Three.js).** Each keyframe becomes a 3D surface: a mesh of 192 × 108 vertices pushed
    out to the reconstructed depth. It is placed where the camera really was, and textured with that
    original video frame.
-   - Scrolling moves a real 3D camera along the recovered camera path.
-   - The two nearest keyframe surfaces are rendered from that camera and blended.
+   - Scrolling moves a real 3D camera along the recovered camera path, one pose per video frame.
+     Between them, position and rotation are interpolated with smooth curves (Catmull-Rom), so speed
+     and turning change gradually.
+   - During the roll-up the camera is held exactly where the real camera stood.
+   - The scroll drives the camera through a critically damped spring, so it eases in and out
+     instead of jumping on every wheel step.
+   - The two nearest keyframe surfaces are rendered from that camera. Most of the time one of them
+     is shown; the hand-over happens in the middle. Where the two disagree (a detail the depth
+     doesn't line up perfectly), the hand-over is sharp, so there is never a double image.
    - Moving the mouse moves the camera off the path. On touch screens, a slow sway does the same.
      Near and far things then shift against each other: real parallax.
 
-### Transitions between shots
-| Cut | Result |
-|---|---|
-| Shot 2 → shot 3 (28.8 s) | The cut could be bridged reliably, so both shots share one 3D space and the camera flies from one to the other. |
-| The 18.6 s jump, 24.7 s, 33.6 s and 40.5 s | These shots couldn't be joined accurately enough: the footage doesn't overlap enough, or the bridge was a few degrees off. Each side keeps its own camera and the picture dissolves. |
+### Cuts
+The video has seven hard cuts or jumps: 15.6 s, 18.6 s, 24.7 s, 28.8 s, 33.6 s, 36.5 s and 40.5 s.
+The website keeps them in the same places. When the scroll crosses one, the picture cross-fades over 0.45 s of real
+time; it is never left half-faded when the scroll stops, and the camera holds still during the fade.
+With reduced motion turned on, it cuts directly, like the video.
+
+### No double images at rest
+Two neighbouring keyframes are cross-faded only around the middle of the interval between them, and
+the more their viewpoints differ, the shorter that moment is. When the scroll stops, the picture
+settles on the nearer keyframe within about 0.3 s, so a still picture never shows two images.
 
 ## Files
 
@@ -52,8 +90,8 @@ invented models. Everything you see in 3D was reconstructed from the footage:
 | Styles for the 3D page | `css/showroom.css` (the original `style.css` is unchanged) |
 | Runtime: loading, camera path, rendering, quality | `js/recon.js` |
 | Three.js r170 (MIT), stored locally, no CDN needed | `js/vendor/three/` |
-| Reconstruction data: keyframes, camera path, transitions | `assets/scene/manifest.json` |
-| Reconstruction data: one depth grid per keyframe (192 × 108 values) | `assets/scene/depth/k000.bin` … `k115.bin` |
+| Reconstruction data: keyframes, camera path (one pose per video frame), shutter edge curve | `assets/scene/manifest.json` |
+| Reconstruction data: one depth grid per keyframe (192 × 108 values), named after the video frame | `assets/scene/depth/f0000.bin` … |
 | Original video frames used as textures | `assets/scene/hd/` (1600×900), `assets/scene/sd/` (960×540) |
 | Fallback video | `assets/RVR1.mp4`, `assets/RVR1-mobile.mp4` |
 | The reconstruction pipeline (Python + OpenCV, not needed on the website) | `tools/` |
@@ -62,9 +100,12 @@ invented models. Everything you see in 3D was reconstructed from the footage:
 
 - **Loading screen.** It stays up until the camera path and the first two keyframes (image + depth)
   have loaded and the first view has been drawn. That is about 1 MB, including Three.js.
-- **Background loading.** The rest loads in the background, starting with what is nearest to where
-  you are scrolling. If you jump far ahead, a small "Loading" notice shows until the keyframes there
-  have arrived; this takes about 2 seconds on an 8 Mbit/s connection.
+- **Background loading.** The two shutter frames (closed and open) load first. Then everything
+  between the camera and where you are scrolling to (nearest first), plus 12 s of the tour beyond it;
+  the rest loads as you get closer. Keyframes inside the shutter roll-up only need their image.
+- **No running ahead.** If you scroll faster than the data arrives, the camera waits where the data
+  ends and a small "Loading" notice shows. A long jump (the area buttons) goes straight to its
+  destination with the short cut fade as soon as that has loaded.
 - **Memory.** Only a few frames are kept on the graphics card at a time.
 - **Quality levels.** These are chosen automatically:
 
@@ -94,15 +135,29 @@ invented models. Everything you see in 3D was reconstructed from the footage:
 - **Not a NeRF or Gaussian Splatting model.** Those need a GPU and machine-learning libraries,
   which weren't available here. The pipeline is classic photogrammetry: structure-from-motion and
   multi-view stereo.
-- **The shutter** is a moving object. It is shown as 29 keyframes (every 0.25 s) while it rolls up,
-  each with its own depth, so it moves in steps that are blended, not as a smooth animation.
+- **The shutter** is shown from two surfaces: the closed door and the open door. Its motion is
+  exact as seen from the original camera position. If you move the mouse during the roll-up, the
+  shutter's bottom edge has a slight stretch, where the shutter meets the gallery behind it.
+- **Lighting during the roll-up** (the light spilling onto the floor outside) is cross-faded between
+  video frames 0.25 s apart, not taken from every single frame.
 - **Video screens, reflections and glossy surfaces.** The video screens (EXPERIENCES wall, monitors)
   change content, and the glossy floor shows reflections. These are view-dependent in the footage,
   so they can shimmer a little when blending or when the mouse moves the camera.
 - **Depth is not perfect.** It is noisy on large plain or dark areas, and around thin objects
   (stools, plant leaves). Moving far off the path would show stretching, which is why mouse movement
   is limited per keyframe.
-- **Not one shared space.** Shots 1, 2 + 3, 4 and 5 are separate 3D spaces (see the transitions table).
+- **Not one shared space.** The camera doesn't fly from one shot to the next; the cuts are
+  cross-faded instead.
+
+## Update of 18 Oct 2026 (shutter, camera, double images)
+
+- The keyframes are now named after their video frame (`f0144.webp` …). The older files
+  (`k000.webp` … and `k000.bin` …) are no longer used; `.vercelignore` keeps them out of the
+  deployment, and you can delete them.
+- `_backup_before_fixes/` holds the previous `js/recon.js`, `assets/scene/manifest.json` and README.
+  To go back: copy those three files over the new ones and remove the three `k*` lines from
+  `.vercelignore`. `_backup_before_fixes/js/recon.before-issue3-4.js` is the version from just before
+  the blending and loading changes (same manifest as now).
 
 ## Run locally
 
@@ -123,6 +178,8 @@ You need Python 3 with `opencv-python` (5.x or 4.x with SIFT), `numpy`, `scipy` 
 ```
 cd tools
 python3 recon2.py RVR1_original.mp4 work features match sfm bridge
+python3 shutter_track.py RVR1_original.mp4 work/shutter.json
+python3 register_all.py RVR1_original.mp4 work
 python3 export.py RVR1_original.mp4 work ..
 ```
 

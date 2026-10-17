@@ -1,2 +1,6 @@
 tools/
 README.md
+_backup_before_fixes/
+assets/scene/hd/k*.webp
+assets/scene/sd/k*.webp
+assets/scene/depth/k*.bin
